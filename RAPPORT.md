@@ -500,10 +500,219 @@ Pour le klaxon et l'annonce, activer puis desactiver la fonction entre chaque ut
 
 ---
 
-## 9. Bilan et perspectives
+## 9. Partie III -- Integration MicroBlaze
 
-Le systeme implemente couvre l'integralite de la Partie 4 du sujet : generation de trames DCC conformes au protocole, emission continue avec temporisation de 6 ms, et commande via les interrupteurs de la carte Basys 3.
+### 9.1 Principe
 
-Les choix de conception (registre fixe a 51 bits, preambule etendu, FSM Moore, etat RESET_CTR pour la synchronisation inter-horloges) privilegient la **simplicite** et la **robustesse** tout en respectant strictement les specifications du protocole DCC et les tolerances de timing imposees.
+Le module `DCC_FRAME_GENERATOR` est remplace par un **AXI Wrapper** qui rattache la Centrale DCC au bus AXI du MicroBlaze. La gestion des entrees/sorties (interrupteurs, boutons, LEDs) est desormais assuree par le MicroBlaze via des controleurs GPIO. Le code C construit la trame DCC complete et l'ecrit dans les registres de l'IP.
 
-Pour la suite du projet (Partie III du sujet), le module `DCC_FRAME_GENERATOR` sera remplace par un **AXI Wrapper** permettant au Microblaze de piloter la Centrale DCC via le bus AXI. Les autres modules (MAE, DCC_BIT, REGISTRE_DCC, CLK_DIV, COMPTEUR_TEMPO) restent inchanges et constituent le coeur de l'IP.
+### 9.2 Architecture du systeme MicroBlaze
+
+```
+                              +----------+
+                              | MicroBlaze|
+                              +-----+----+
+                                    |
+                               BUS AXI
+          +--------+--------+------+------+--------+
+          |        |        |             |        |
+     +----+---+ +--+---+ +-+----+  +-----+-----+ +----+----+
+     |GPIO    | |GPIO  | |GPIO  |  |CENTRALE   | | BRAM    |
+     |Switches| |Boutons| |LEDs  |  |DCC IP     | | (RAM)   |
+     |16b in  | |5b in | |16b out|  |           | |         |
+     +--------+ +------+ +------+  +-----+-----+ +---------+
+                                          |
+                                     SORTIE_DCC --> JB[4]
+```
+
+### 9.3 Approche retenue : le C prepare la trame
+
+Le sujet propose deux approches. Nous avons choisi la **premiere** : le code C du MicroBlaze prepare la trame DCC exacte au bit pres (51 bits avec preambule, start bits, octet de controle XOR) et la transfere dans les registres AXI de l'IP.
+
+**Justification** :
+- L'IP VHDL reste minimale (pas de decodeur de commandes supplementaire dans le wrapper).
+- Le code C est plus flexible : ajout de nouvelles commandes sans modifier le VHDL.
+- Les 6 modules du coeur DCC (CLK_DIV, COMPTEUR_TEMPO, REGISTRE_DCC, MAE, DCC_BIT_1, DCC_BIT_0) sont reutilises **sans aucune modification**.
+
+### 9.4 IP Centrale DCC -- Architecture interne
+
+**Fichiers** : `ip/Centrale_DCC_v1_0.vhd` (top) et `ip/Centrale_DCC_v1_0_S00_AXI.vhd` (AXI slave + coeur)
+
+```
++--------------------------------------------------------------+
+|  IP Centrale_DCC_v1_0                                        |
+|                                                              |
+|  +---------------------------+    +------------------------+ |
+|  | AXI4-Lite Slave Logic     |    |  COEUR DCC             | |
+|  |                           |    |                        | |
+|  |  slv_reg0 (bits 31..0) ---+--->| Trame_DCC(31..0)       | |
+|  |  slv_reg1 (bits 18..0) ---+--->| Trame_DCC(50..32)      | |
+|  |                           |    |                        | |
+|  |  S_AXI_ARESETN ----[NOT]--+--->| Reset (actif haut)     | |
+|  |  S_AXI_ACLK -------------+--->| CLK 100MHz             | |
+|  |                           |    |                        | |
+|  +---------------------------+    |  CLK_DIV -> COMPTEUR   | |
+|                                   |  MAE -> REGISTRE_DCC   | |
+|         BUS AXI                   |  DCC_BIT_1, DCC_BIT_0  | |
+|                                   |         |              | |
+|                                   +---------|--+-----------+ |
+|                                             |  |             |
++---------------------------------------------|--+-------------+
+                                              v
+                                         SORTIE_DCC
+```
+
+#### Map des registres AXI
+
+| Offset | Registre  | Bits utilises | Contenu                              |
+|--------|-----------|---------------|--------------------------------------|
+| 0x00   | slv_reg0  | [31:0]        | Trame_DCC(31 downto 0)               |
+| 0x04   | slv_reg1  | [18:0]        | Trame_DCC(50 downto 32)              |
+| 0x08   | slv_reg2  | --            | Reserve                              |
+| 0x0C   | slv_reg3  | --            | Reserve                              |
+
+La composition de la trame dans le VHDL est directe :
+```vhdl
+Trame_DCC <= slv_reg1(18 downto 0) & slv_reg0;
+```
+
+#### Inversion du reset
+
+Le signal `S_AXI_ARESETN` du bus AXI est **actif au niveau bas**, tandis que les modules DCC utilisent un reset **actif haut**. L'inversion est realisee par :
+```vhdl
+Reset_DCC <= not S_AXI_ARESETN;
+```
+
+#### Horloge
+
+L'horloge `S_AXI_ACLK` (100 MHz) est directement utilisee comme horloge systeme du coeur DCC. Le CLK_DIV derive l'horloge 1 MHz a partir de celle-ci.
+
+### 9.5 Code C MicroBlaze
+
+**Fichier** : `microblaze/main.c`
+
+#### Construction des trames en C
+
+Deux fonctions construisent les trames DCC en manipulant un entier 64 bits :
+
+- `build_frame_1byte(addr, cmd, frame[2])` : trame a 1 octet de commande (preambule etendu a 23 bits)
+- `build_frame_2bytes(addr, cmd1, cmd2, frame[2])` : trame a 2 octets de commande (preambule 14 bits)
+
+Chaque fonction calcule automatiquement l'octet de controle (XOR de tous les octets precedents), insere les start/stop bits, et decoupe le resultat en 2 mots de 32 bits pour les registres AXI.
+
+Exemple pour une trame 1 octet :
+```c
+u8 ctrl = addr ^ cmd;
+u64 trame = 0x7FFFFF;    // 23 bits de preambule
+trame <<= 1;              // start bit (0)
+trame = (trame << 8) | addr;
+trame <<= 1;              // start bit
+trame = (trame << 8) | cmd;
+trame <<= 1;              // start bit
+trame = (trame << 8) | ctrl;
+trame = (trame << 1) | 1; // stop bit
+frame[0] = (u32)(trame);
+frame[1] = (u32)(trame >> 32);
+```
+
+#### Interface utilisateur
+
+| Peripherique   | Role                                        |
+|----------------|---------------------------------------------|
+| SW[15:12]      | Adresse du train (1-15, defaut 3 si 0)      |
+| SW[7:0]        | Selection de commande (meme mapping que Partie II) |
+| btnR           | Validation : envoie la trame a l'IP         |
+| LED[7:0]       | Miroir de SW[7:0] (retour visuel)           |
+
+Le bouton de validation est traite par **polling** avec detection de front montant (comparaison avec l'etat precedent). Seul un appui sur btnR declenche l'ecriture dans les registres de l'IP, conformement a l'exigence du sujet : "le Microblaze ne transmettra de trame a l'IP que si l'utilisateur appuie sur un bouton de validation."
+
+### 9.6 Procedure de creation dans Vivado/Vitis
+
+#### Etape 1 : Creer l'IP dans Vivado
+
+1. **Tools > Create and Package New IP > Create a new AXI4 peripheral**
+2. Nommer l'IP `Centrale_DCC_v1_0`, interface AXI4-Lite Slave, 4 registres
+3. Choisir "Edit IP" pour ouvrir le projet d'edition
+4. **Remplacer** les fichiers generes :
+   - `Centrale_DCC_v1_0_S00_AXI.vhd` par celui fourni dans `ip/`
+   - `Centrale_DCC_v1_0.vhd` par celui fourni dans `ip/`
+5. **Ajouter** les sources du coeur DCC au projet IP :
+   - `src/DCC_Bit_1.vhd`, `src/DCC_Bit_0.vhd`, `src/Registre_DCC.vhd`, `src/MAE.vhd`
+   - `Codes source a recuperer-20260220/Diviseur_Horloge.vhd`, `Compteur_Tempo.vhd`
+6. Dans le **Package IP** wizard :
+   - Onglet **Ports and Interfaces** : ajouter le port `SORTIE_DCC` comme port externe
+   - Onglet **File Groups** : merger les changements
+   - **Re-Package IP**
+
+#### Etape 2 : Creer le Block Design
+
+1. **Create Block Design**
+2. Ajouter les IP suivantes :
+   - **MicroBlaze** (configuration par defaut avec memoire locale)
+   - **AXI GPIO** x3 (switches 16b, boutons 5b, LEDs 16b)
+   - **Centrale_DCC_v1_0** (l'IP creee a l'etape 1)
+   - **Clocking Wizard** si necessaire (100 MHz)
+3. Lancer **Run Connection Automation** pour connecter le bus AXI
+4. Rendre le port `SORTIE_DCC` externe (clic droit > Make External)
+5. Assigner la broche **A15** (JB[4]) a `SORTIE_DCC` dans les contraintes
+6. Assigner les broches GPIO selon la XDC Basys 3
+7. **Validate Design**, puis **Generate Bitstream**
+
+#### Etape 3 : Code C dans Vitis
+
+1. Exporter le hardware depuis Vivado (File > Export > Export Hardware, inclure bitstream)
+2. Ouvrir Vitis, creer une **Application Platform** depuis le .xsa exporte
+3. Creer un projet Application C, remplacer le `main.c` par celui de `microblaze/`
+4. **Adapter les adresses de base** dans `main.c` si les noms d'instances GPIO different de ceux generes (verifier dans `xparameters.h`)
+5. Build, puis **Run > Launch on Hardware**
+
+### 9.7 Arborescence complete du projet (Parties II + III)
+
+```
+M1_Sorbonne_SysCom_UM4IN108-FPGA_Projet/
+|
+|-- Codes source a recuperer-20260220/    (fichiers fournis)
+|   |-- Diviseur_Horloge.vhd
+|   |-- Compteur_Tempo.vhd
+|   |-- Generateur_Trames.vhd            (squelette original)
+|   +-- Basys-3-Master.xdc
+|
+|-- src/                                  (Partie II -- standalone)
+|   |-- DCC_Bit_1.vhd
+|   |-- DCC_Bit_0.vhd
+|   |-- Registre_DCC.vhd
+|   |-- MAE.vhd
+|   |-- Generateur_Trames.vhd            (complete)
+|   +-- Top_DCC.vhd
+|
+|-- sim/                                  (testbenches)
+|   |-- TB_DCC_Bit_1.vhd
+|   |-- TB_DCC_Bit_0.vhd
+|   |-- TB_Registre_DCC.vhd
+|   |-- TB_MAE.vhd
+|   +-- TB_Top_DCC.vhd
+|
+|-- ip/                                   (Partie III -- IP MicroBlaze)
+|   |-- Centrale_DCC_v1_0.vhd            (top-level IP)
+|   +-- Centrale_DCC_v1_0_S00_AXI.vhd    (AXI slave + coeur DCC)
+|
+|-- microblaze/                           (code C MicroBlaze)
+|   +-- main.c
+|
+|-- constraints/
+|   +-- Top_DCC.xdc                       (Partie II)
+|
++-- RAPPORT.md
+```
+
+---
+
+## 10. Bilan
+
+Le projet couvre les deux parties du sujet :
+
+- **Partie II** : Centrale DCC standalone, entierement fonctionnelle, pilotee par les interrupteurs de la carte. Tous les modules VHDL sont decrits, testes par des testbenches avec ASSERT, et assembles dans un Top_DCC pret a synthetiser.
+
+- **Partie III** : Integration de la Centrale DCC comme IP AXI4-Lite dans un systeme MicroBlaze. Le coeur DCC (6 modules) est reutilise sans modification. Le code C construit les trames DCC au bit pres et les envoie a l'IP via les registres AXI, uniquement sur validation par bouton.
+
+Les choix de conception (registre fixe a 51 bits, preambule etendu, FSM Moore, etat RESET_CTR, approche "C prepare la trame") privilegient la **simplicite** et la **robustesse** tout en respectant strictement les specifications du protocole DCC.
